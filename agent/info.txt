@@ -1,0 +1,86 @@
+在修改后的代码中，**动作梯度的计算和优先级更新主要发生在 `Dipo1.py` 文件的 `action_gradient` 方法中**。具体实现如下：
+
+
+### 1. **动作梯度的计算**
+在 `action_gradient` 方法中，通过以下步骤计算动作梯度：
+```python
+def action_gradient(self, batch_size, log_writer):
+    states, best_actions, idxs = self.diffusion_memory.sample(batch_size)
+
+    # 优化动作以最大化Q值
+    actions_optim = torch.optim.Adam([best_actions], lr=self.action_lr, eps=1e-5)
+    for i in range(self.action_gradient_steps):
+        best_actions.requires_grad_(True)
+        q1, q2 = self.critic(states, best_actions)
+        loss = -torch.min(q1, q2)  # 最大化Q值 = 最小化负Q值
+
+        actions_optim.zero_grad()
+        loss.backward(torch.ones_like(loss))  # 计算动作梯度 ∇a Q(s,a)
+
+        # 梯度裁剪（可选）
+        if self.action_grad_norm > 0:
+            nn.utils.clip_grad_norm_([best_actions], max_norm=self.action_grad_norm, norm_type=2)
+
+        actions_optim.step()
+        best_actions.requires_grad_(False)
+        best_actions.clamp_(-1., 1.)
+
+    # 关键点：计算动作梯度的大小（范数）
+    grad_norms = []
+    for i in range(len(states)):
+        grad_norm = torch.norm(best_actions.grad[i])  # 计算每个动作梯度的L2范数
+        grad_norms.append(grad_norm.item())
+
+    # 更新经验池中的优先级
+    self.memory.update_priorities(idxs, np.array(grad_norms))
+
+    return states, best_actions
+```
+
+
+### 2. **优先级的更新**
+计算完动作梯度后，通过以下代码将梯度大小传递给经验池：
+```python
+# 计算动作梯度的大小
+grad_norms = []
+for i in range(len(states)):
+    grad_norm = torch.norm(best_actions.grad[i])  # 计算梯度的L2范数
+    grad_norms.append(grad_norm.item())
+
+# 更新经验池中的优先级
+self.memory.update_priorities(idxs, np.array(grad_norms))
+```
+
+这里：
+- `best_actions.grad` 存储了每个动作关于Q值的梯度 `∇a Q(s,a)`
+- `torch.norm(best_actions.grad[i])` 计算了第 `i` 个动作梯度的L2范数（即大小）
+- `self.memory.update_priorities(idxs, np.array(grad_norms))` 将梯度大小作为优先级更新到经验池中
+
+
+### 3. **优先级在经验池中的应用**
+在 `replay_memory.py` 中，`ReplayMemory` 类使用这些优先级进行采样：
+```python
+def sample(self, batch_size, alpha=0.6):
+    if self.full:
+        priorities = self.priorities
+    else:
+        priorities = self.priorities[:self.idx]
+
+    probs = priorities ** alpha  # α 控制优先级的影响程度
+    probs /= probs.sum()
+
+    idxs = np.random.choice(len(priorities), batch_size, p=probs)
+    # ... 返回采样的经验 ...
+```
+
+这里，优先级越高的经验被采样的概率越大，实现了**基于动作梯度的动态优先级经验回放**。
+
+
+### 总结
+核心流程为：
+1. **计算梯度**：在 `action_gradient` 中，通过 `loss.backward()` 计算动作关于Q值的梯度
+2. **梯度范数作为优先级**：计算梯度的L2范数（大小），作为对应经验的优先级
+3. **更新优先级**：调用 `update_priorities` 方法将优先级存储到经验池中
+4. **优先级采样**：在 `sample` 方法中，根据优先级调整采样概率
+
+这种设计使得**动作梯度大的经验（即对提升Q值更重要的经验）会被更频繁地采样**，从而加速学习过程。
